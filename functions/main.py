@@ -1,5 +1,7 @@
+from io import BytesIO
 from pydantic import BaseModel
 from firebase_functions import https_fn
+from firebase_functions import storage_fn
 from firebase_functions.firestore_fn import (
   on_document_created,
   Event,
@@ -7,8 +9,14 @@ from firebase_functions.firestore_fn import (
 )
 from firebase_admin import initialize_app
 from firebase_admin import firestore
+from firebase_admin import storage as fb_storage
+from google.cloud import storage
+import firebase_admin
 from openai import OpenAI
 from firebase_functions.params import SecretParam
+import requests
+import urllib.parse
+
 
 OPENAI_API_KEY = SecretParam("OPENAI_API_KEY")
 DEFAULT_FRIDGE_ID = "Vely0XkPLzum8Hb5KlTL"
@@ -37,7 +45,20 @@ class FridgeInventory(BaseModel):
 
 # For testing
 @https_fn.on_request()
-def add_image(request):
+def create_empty_shopping_list(request) -> str:
+    # Firestore client
+    db = firestore.client()
+    
+    # Create the shopping list in Firestore
+    db.collection("fridges").document(DEFAULT_FRIDGE_ID).collection("shopping-lists").add({
+        "items": []
+    })
+    
+    return "Empty shopping list created"
+
+# For testing
+@https_fn.on_request()
+def add_image(request) -> str:
     db = firestore.client()
     db.collection("fridges").document(DEFAULT_FRIDGE_ID).collection("images").add({
         "date": "2024-12-12",
@@ -48,6 +69,8 @@ def add_image(request):
 # On database trigger in the 'images' collection
 @on_document_created(document="fridges/{fridgeId}/images/{imagesId}", secrets=[OPENAI_API_KEY])
 def analyze_image(event: Event[DocumentSnapshot]) -> None:
+    print("Analyzing image")
+
     images = event.data.to_dict()
     date = images.get("date")
     urls = images.get("urls")
@@ -93,7 +116,7 @@ def recommend_recipe(event: Event[DocumentSnapshot]) -> None:
     completion = client.beta.chat.completions.parse(
         model="gpt-4o-2024-08-06",
         messages=[
-            {"role": "system", "content": "Make a recipe with the given inventory. Try to use the ingredients that are about to expire."},
+            {"role": "system", "content": "Make a sensible but creative recipe with some of the given inventory. Try to use the ingredients that are about to expire. If necessary, add some additional ingredients."},
             {"role": "user", "content": f"Inventory: {inventory}"},
         ],
         response_format=Recipe,
@@ -101,7 +124,7 @@ def recommend_recipe(event: Event[DocumentSnapshot]) -> None:
     recipe = completion.choices[0].message.parsed
     recipe_data = recipe.dict()
 
-    # Add Image
+    # Generate Image
     response = client.images.generate(
         model="dall-e-3",
         prompt=f"Photorealistic image of {recipe_data['name']} recipe",
@@ -109,10 +132,47 @@ def recommend_recipe(event: Event[DocumentSnapshot]) -> None:
         quality="standard",
         n=1,
     )
-    image_url = response.data[0].url
-    recipe_data["image"] = image_url
+    openai_image_url = response.data[0].url
+
+    # Download image
+    response = requests.get(openai_image_url)
+    if response.status_code != 200:
+        raise Exception(f"Failed to download image from {openai_image_url}, status code: {response.status_code}")
+
+    image_data = BytesIO(response.content)  # Use an in-memory byte stream
+    print(f"Image downloaded from {openai_image_url}.")
+
+    # Upload the image data to Google Cloud Storage
+    storage_client = storage.Client()
+    bucket = storage_client.bucket("frost-recipes-images")
+    destination_blob_name = event.params["fridgeId"] + "/recipe-images/" + recipe_data["name"] + ".jpg"
+    blob = bucket.blob(destination_blob_name)
+
+    # Upload the image from the in-memory byte stream
+    blob.upload_from_file(image_data, content_type=response.headers.get('Content-Type'))
+    print(f"Image uploaded to {destination_blob_name}")
+
+    # Store image in Firebase Storage
+    bucket = fb_storage.bucket()
+    image_url = bucket.blob(destination_blob_name).public_url
+    recipe_data["image_url"] = image_url
 
     # Save recipe to database
     db = firestore.client()
     db.collection("fridges").document(event.params["fridgeId"]).collection("recipes").document(event.params["inventoryId"]).set(recipe_data) # TODO - Allow multiple recipes
     
+# On Upload to Firebase Storage create a new document in the 'images' collection
+@storage_fn.on_object_finalized(bucket="fridge-captures", region="europe-west3")
+def add_image_to_db(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
+    print("Adding image to database")
+
+    fridge_id, image_id = event.data.name.split("/")
+
+    name = urllib.parse.quote(event.data.name, safe='')
+    img_url = f"https://firebasestorage.googleapis.com/v0/b/fridge-captures/o/{name}?alt=media"
+
+    db = firestore.client()
+    db.collection("fridges").document(fridge_id).collection("images").document(image_id).set({
+        "date": event.data.time_created,
+        "urls": [img_url]
+    })
